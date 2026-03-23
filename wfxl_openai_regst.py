@@ -31,10 +31,13 @@ from curl_cffi import requests
 from curl_cffi import CurlMime
 
 # ================= 配置区开始 =================
-MAIL_DOMAIN = "your-domain.com" # 你的临时邮箱域名
+MAIL_DOMAINS = "domain1.com,domain2.xyz,domain3.net" # 你的临时邮箱域名
 GPTMAIL_BASE = "https://your-domain.com" # 你的临时邮箱api
-ADMIN_AUTH = "xxxxx" # 你的临时邮箱管理员密码
+ADMIN_AUTH = "xxxxx" # 你的admin模式临时邮箱管理员密码
 TOKEN_OUTPUT_DIR = os.getenv("TOKEN_OUTPUT_DIR", "").strip()
+
+EMAIL_API_MODE = "admin" # 【开关】可选: "admin" (原后台建号模式) 或 "apikey" (Cloudflare Worker直连模式)
+GPTMAIL_API_KEY = "your_api_key_here" # 模式 "apikey" 专属 你的 API KEY
 
 # ================= 这里不要动 =================
 AUTH_URL = "https://auth.openai.com/oauth/authorize"
@@ -105,8 +108,20 @@ def get_email_and_token(proxies: Any = None) -> tuple:
     suffix = ''.join(random.choices(string.ascii_lowercase, k=random.randint(1, 3)))
     prefix = letters + digits + suffix
     
+    domain_list = [d.strip() for d in MAIL_DOMAINS.split(",") if d.strip()]
+        if not domain_list:
+            print(f"[{ts()}] [ERROR] MAIL_DOMAINS 配置为空，无法生成邮箱！")
+            return None, None
+            
+    selected_domain = random.choice(domain_list)
+    
+    if EMAIL_API_MODE == "apikey":
+        email = f"{prefix}@{MAIL_DOMAIN}"
+        print(f"[{ts()}] [INFO] 成功生成临时域名邮箱: {email}")
+        return email, ""
+
     headers = {"x-admin-auth": ADMIN_AUTH, "Content-Type": "application/json"}
-    body = {"enablePrefix": False, "name": prefix, "domain": MAIL_DOMAIN}
+    body = {"enablePrefix": False, "name": prefix, "domain": selected_domain}
     
     for attempt in range(5):
         try:
@@ -182,6 +197,23 @@ def _extract_mail_fields(mail: dict) -> dict:
     body_text = unescape(re.sub(r"<[^>]+>", " ", body_text))
     return {"sender": sender, "subject": subject, "body": body_text, "raw": raw}
 
+
+def _extract_otp_code(content: str) -> str:
+    """提取验证码的增强正则"""
+    if not content: return ""
+    patterns = [
+        r"(?i)Your ChatGPT code is\s*(\d{6})",
+        r"(?i)ChatGPT code is\s*(\d{6})",
+        r"(?i)verification code to continue:\s*(\d{6})",
+        r"(?i)Subject:.*?(\d{6})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, content)
+        if match:
+            return match.group(1)
+    fallback = re.search(r"(?<!\d)(\d{6})(?!\d)", content)
+    return fallback.group(1) if fallback else ""
+
 def get_oai_code(email: str, jwt: str = "", proxies: Any = None, processed_mail_ids: set = None, pattern: str = OTP_CODE_PATTERN) -> str:
     """基于 Mail ID 过滤的验证码提取 (支持 JWT 或 Admin 双重鉴权)"""
     base_url = GPTMAIL_BASE.rstrip('/')
@@ -192,48 +224,91 @@ def get_oai_code(email: str, jwt: str = "", proxies: Any = None, processed_mail_
 
     for attempt in range(40):
         try:
-            if jwt:
+            if EMAIL_API_MODE == "apikey":
+                headers = {"X-API-Key": GPTMAIL_API_KEY}
                 res = requests.get(
-                    f"{base_url}/api/mails",
-                    params={"limit": 20, "offset": 0},
-                    headers={"Authorization": "Bearer " + jwt, "Content-Type": "application/json", "Accept": "application/json"},
+                    f"{base_url}/api/emails",
+                    params={"email": email},
+                    headers=headers,
                     proxies=proxies, verify=_ssl_verify(), timeout=15,
                 )
+                if res.status_code == 200:
+                    j = res.json()
+                    if j.get("success"):
+                        emails_list = (j.get("data") or {}).get("emails", [])
+                        if isinstance(emails_list, list) and emails_list:
+                            for mail in emails_list:
+                                mail_id = mail.get("id", "")
+                                if not mail_id or mail_id in processed_mail_ids:
+                                    continue
+                                
+                                content = ""
+                                detail_res = requests.get(
+                                    f"{base_url}/api/email/{mail_id}",
+                                    headers=headers,
+                                    proxies=proxies, verify=_ssl_verify(), timeout=15,
+                                )
+                                if detail_res.status_code == 200:
+                                    detail = detail_res.json()
+                                    if detail.get("success"):
+                                        d = detail.get("data") or {}
+                                        content = "\n".join(filter(None, [
+                                            str(d.get("subject") or ""),
+                                            str(d.get("content") or ""),
+                                            str(d.get("html_content") or ""),
+                                        ]))
+                                        
+                                if not content:
+                                    content = str(mail.get("subject") or "")
+                                
+                                code = _extract_otp_code(content)
+                                if code:
+                                    processed_mail_ids.add(mail_id)
+                                    print(f" 提取成功: {code}")
+                                    return code
             else:
-                res = requests.get(
-                    f"{base_url}/admin/mails",
-                    params={"limit": 20, "offset": 0, "address": email},
-                    headers={"x-admin-auth": ADMIN_AUTH},
-                    proxies=proxies, verify=_ssl_verify(), timeout=15,
-                )
-            
-            if res.status_code != 200:
-                print(f"\n[{ts()}] [ERROR] 邮箱接口请求失败 (HTTP {res.status_code}): {res.text}")
-                time.sleep(3)
-                continue
+                if jwt:
+                    res = requests.get(
+                        f"{base_url}/api/mails",
+                        params={"limit": 20, "offset": 0},
+                        headers={"Authorization": "Bearer " + jwt, "Content-Type": "application/json", "Accept": "application/json"},
+                        proxies=proxies, verify=_ssl_verify(), timeout=15,
+                    )
+                else:
+                    res = requests.get(
+                        f"{base_url}/admin/mails",
+                        params={"limit": 20, "offset": 0, "address": email},
+                        headers={"x-admin-auth": ADMIN_AUTH},
+                        proxies=proxies, verify=_ssl_verify(), timeout=15,
+                    )
+                
+                if res.status_code != 200:
+                    print(f"\n[{ts()}] [ERROR] 邮箱接口请求失败 (HTTP {res.status_code}): {res.text}")
+                    time.sleep(3)
+                    continue
 
-            results = res.json().get("results")
-            if results and len(results) > 0:
-                for mail in results:
-                    mail_id = mail.get("id")
-                    if not mail_id or mail_id in processed_mail_ids:
-                        continue
+                results = res.json().get("results")
+                if results and len(results) > 0:
+                    for mail in results:
+                        mail_id = mail.get("id")
+                        if not mail_id or mail_id in processed_mail_ids:
+                            continue
 
-                    parsed = _extract_mail_fields(mail)
-                    content = f"{parsed['subject']}\n{parsed['body']}".strip()
+                        parsed = _extract_mail_fields(mail)
+                        content = f"{parsed['subject']}\n{parsed['body']}".strip()
 
-                    if "openai" not in parsed["sender"].lower() and "openai" not in content.lower():
-                        continue
+                        if "openai" not in parsed["sender"].lower() and "openai" not in content.lower():
+                            continue
 
-                    match = re.search(pattern, content)
-                    if match:
-                        code = match.group(1)
-                        processed_mail_ids.add(mail_id)
-                        print(f" 提取成功: {code}")
-                        return code
-                print(".", end="", flush=True)
-            else:
-                print(".", end="", flush=True)
+                        match = re.search(pattern, content)
+                        if match:
+                            code = match.group(1)
+                            processed_mail_ids.add(mail_id)
+                            print(f" 提取成功: {code}")
+                            return code
+                    print(".", end="", flush=True)
+                else:
+                    print(".", end="", flush=True)
         except Exception as e:
             print(".", end="", flush=True)
 
