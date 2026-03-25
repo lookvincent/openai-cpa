@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import uuid
 import yaml
+from proxy_manager import smart_switch_node
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -73,6 +74,11 @@ MIN_ACCOUNTS_THRESHOLD = _cpa.get("min_accounts_threshold", 30)
 BATCH_REG_COUNT = _cpa.get("batch_reg_count", 1)
 MIN_REMAINING_WEEKLY_PERCENT = _cpa.get("min_remaining_weekly_percent", 80)
 CHECK_INTERVAL_MINUTES = _cpa.get("check_interval_minutes", 60)
+
+_normal = _c.get("normal_mode", {})
+NORMAL_SLEEP_MIN = _normal.get("sleep_min", 5)
+NORMAL_SLEEP_MAX = _normal.get("sleep_max", 30)
+
 
 # --- 以下为内容不要改变 ---
 AUTH_URL = "https://auth.openai.com/oauth/authorize"
@@ -1419,6 +1425,10 @@ async def cpa_main_loop(args):
             if valid_count < MIN_ACCOUNTS_THRESHOLD:
                 print(f"[{ts()}] [INFO] 侦测到库存不足 (当前 {valid_count} < 阈值 {MIN_ACCOUNTS_THRESHOLD})，启动注册补货...")
                 for _ in range(BATCH_REG_COUNT):
+                    if not smart_switch_node():
+                        print(f"[{ts()}] [WARNING] 节点切换失败，将使用当前 IP 继续尝试...")
+                    await asyncio.sleep(1)
+                    
                     result = await loop.run_in_executor(None, run, args.proxy)
                     if not result:
                         continue
@@ -1469,14 +1479,17 @@ async def cpa_main_loop(args):
 
 def normal_main_loop(args):
     """常规模式 (纯量产注册，存本地)"""
-    sleep_min = max(1, args.sleep_min)
-    sleep_max = max(sleep_min, args.sleep_max)
+    sleep_min = max(1, NORMAL_SLEEP_MIN)
+    sleep_max = max(sleep_min, NORMAL_SLEEP_MAX)
     count = 0
 
     while True:
         count += 1
         print(f"\n[{ts()}] >>> 开始第 {count} 次量产注册任务 <<<")
-
+        
+        if not smart_switch_node():
+            print(f"[{ts()}] [WARNING] 节点切换失败，将使用当前 IP 继续尝试...")
+        time.sleep(1)
         try:
             result = run(args.proxy)
             if not result:
@@ -1526,8 +1539,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="OpenAI 自动注册 & CPA 检测一体")
     parser.add_argument("--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890")
     parser.add_argument("--once", action="store_true", help="只运行一次 (常规模式下有效)")
-    parser.add_argument("--sleep-min", type=int, default=5, help="循环模式最短等待秒数")
-    parser.add_argument("--sleep-max", type=int, default=30, help="循环模式最长等待秒数")
+    # parser.add_argument("--sleep-min", type=int, default=5, help="循环模式最短等待秒数")
+    # parser.add_argument("--sleep-max", type=int, default=30, help="循环模式最长等待秒数")
     args = parser.parse_args()
     args.proxy = DEFAULT_PROXY if DEFAULT_PROXY.strip() else None
     print("=" * 65)
