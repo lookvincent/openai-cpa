@@ -11,7 +11,7 @@ email_api_mode: "cloudflare_temp_email"
 
 mail_domains: "domain1.com,domain2.xyz,domain3.net"
 # 你的临时邮箱 后端API 基础地址 结尾不要/，IMAP和freemail/cloudmail/mail_curl不需要配置此项。注意：用浏览器打开后端api验证是否可访问
-gptmail_base: "https://your-domain.com"
+gptmail_base: "https://your-domain.com" #是后端访问链接，不是前端访问链接，正常情况浏览器打开访问会显示ok就是对的
 
 # [模式 "cloudflare_temp_email" 专属配置]
 # 你的临时邮箱管理员密码
@@ -30,17 +30,22 @@ imap:
 
 # [模式 "freemail" 专属]
 freemail:
+  #访问链接
   api_url: "https://your-domain.com"
+  #JWTTOKEN
   api_token: ""
 
 # [模式 "cloud-mail" 专属配置]
 cloudmail:
+  #访问链接
   api_url: "https://your-domain.com"
+  #管理员邮箱
   admin_email: "admin@your-domain.com"
   admin_password: "你的管理员密码"
 
 # [模式 "mail_curl" 专属配置]
 mail_curl:
+  #访问链接
   api_base: "https://your-domain.com"
   key: "" # 你的密钥
 
@@ -59,8 +64,12 @@ reg_threads: 10
 clash_proxy_pool:
   # 【开关】是否在每次注册前自动通过 Clash 切换节点
   enable: false
+  # 【核心开关】true=服务器10容器独立推算模式；false=本地单机/单容器模式
+  pool_mode: false
   # Clash 的外部控制 API 地址 (注意端口通常是 9090 或 9097)
   api_url: "http://127.0.0.1:9097"
+  #true为测速优选，false为随机盲抽。提示：如果A节点一直是最低延迟那么可能每次都是A节点。
+  fastest_mode: false
   # 你机场包含所有节点的策略组名称，带有 Emoji 也没关系
   group_name: "节点选择"
   # Clash 的外部控制鉴权秘钥 (Secret)
@@ -88,6 +97,17 @@ clash_proxy_pool:
     - "China"
     - "回国"
 
+warp_proxy_list:
+  - "http://127.0.0.1:41001"
+  - "http://127.0.0.1:41002"
+  - "http://127.0.0.1:41003"
+  - "http://127.0.0.1:41004"
+  - "http://127.0.0.1:41005"
+  - "http://127.0.0.1:41006"
+  - "http://127.0.0.1:41007"
+  - "http://127.0.0.1:41008"
+  - "http://127.0.0.1:41009"
+  - "http://127.0.0.1:41010"
 
 
 # [验证码重发次数配置，默认5次]

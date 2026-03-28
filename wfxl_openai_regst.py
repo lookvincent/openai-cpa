@@ -11,6 +11,10 @@ import argparse
 import asyncio
 import uuid
 import yaml
+import subprocess
+import builtins
+import threading
+import io
 from proxy_manager import smart_switch_node
 from datetime import datetime
 from dataclasses import dataclass
@@ -19,7 +23,7 @@ import urllib.parse
 from urllib.parse import urlparse, parse_qs, quote
 from html import unescape
 from concurrent.futures import ThreadPoolExecutor
-
+import queue
 import imaplib
 import socks
 import socket
@@ -97,6 +101,21 @@ NORMAL_SLEEP_MIN = _normal.get("sleep_min", 5)
 NORMAL_SLEEP_MAX = _normal.get("sleep_max", 30)
 NORMAL_TARGET_COUNT = _normal.get("target_count", 0)
 
+WARP_PROXY_LIST = _c.get("warp_proxy_list", [])
+_clash_conf = _c.get("clash_proxy_pool", {})
+_clash_enable = _clash_conf.get("enable", False)
+_clash_pool_mode = _clash_conf.get("pool_mode", False)
+if not _clash_enable:
+    WARP_PROXY_LIST = []
+elif not _clash_pool_mode:
+    WARP_PROXY_LIST = []
+PROXY_QUEUE = queue.Queue()
+
+if _clash_enable and _clash_pool_mode:
+    for p in WARP_PROXY_LIST:
+        PROXY_QUEUE.put(p)
+else:
+    PROXY_QUEUE.put(DEFAULT_PROXY or None)
 
 # --- 以下为内容不要改变 ---
 AUTH_URL = "https://auth.openai.com/oauth/authorize"
@@ -132,6 +151,38 @@ def _load_dotenv(path: str = ".env") -> None:
     except Exception: pass
 
 _load_dotenv()
+
+_original_print = builtins.print
+_thread_local = threading.local()
+_print_lock = threading.Lock()
+
+def thread_safe_print(*args, **kwargs):
+    """
+    智能拦截器：
+    单线程下：原样输出，保留进度条打点效果。
+    多线程下：把同一个线程里的 `end=""` 缓存起来，直到遇到换行符才一次性加锁输出。
+    """
+    if not globals().get("ENABLE_MULTI_THREAD_REG", False):
+        with _print_lock:
+            _original_print(*args, **kwargs)
+        return
+    if not hasattr(_thread_local, 'buffer'):
+        _thread_local.buffer = ""
+
+    temp_io = io.StringIO()
+    _original_print(*args, file=temp_io, **kwargs)
+
+    _thread_local.buffer += temp_io.getvalue()
+
+    if _thread_local.buffer.endswith('\n'):
+        with _print_lock:
+            final_msg = _thread_local.buffer.lstrip('\n')
+            if final_msg:
+                _original_print(final_msg, end="", flush=True)
+        _thread_local.buffer = ""
+
+builtins.print = thread_safe_print
+
 
 def ts() -> str:
     """获取当前时间戳字符串"""
@@ -1041,15 +1092,26 @@ def _oai_headers(did: str, extra: dict = None):
 
 def run(proxy: Optional[str]) -> tuple:
     processed_mails = set()
+    if proxy and proxy.startswith("socks5://"):
+        proxy = proxy.replace("socks5://", "socks5h://")
     proxies = {"http": proxy, "https": proxy} if proxy else None
+    
     s = requests.Session(proxies=proxies, impersonate="chrome131")
+    s.timeout = 30
 
     if not _skip_net_check():
         try:
-            trace = s.get("https://cloudflare.com/cdn-cgi/trace", proxies=proxies, verify=_ssl_verify(), timeout=10).text
+            start_time = time.time()
+            res = s.get("https://cloudflare.com/cdn-cgi/trace", proxies=proxies, verify=_ssl_verify(), timeout=10)
+            elapsed = time.time() - start_time
+            trace = res.text
+            
             loc = (re.search(r"^loc=(.+)$", trace, re.MULTILINE) or [None, None])[1]
-            if loc in ("CN", "HK"): raise RuntimeError("当前代理所在地不支持 OpenAI 服务 (CN/HK)")
-            print(f"[{ts()}] [INFO] 代理节点检测通过 (所在地: {loc})")
+            ip = (re.search(r"^ip=(.+)$", trace, re.MULTILINE) or [None, None])[1]
+            
+            if loc in ("CN", "HK"): raise RuntimeError(f"当前代理所在地不支持 OpenAI ({loc})")
+
+            print(f"[{ts()}] [INFO] 节点测活成功！地区: {loc} | 延迟: {elapsed:.2f}s")
         except Exception as e:
             print(f"[{ts()}] [ERROR] 代理网络检查失败: {e}")
             return None, None
@@ -1095,7 +1157,7 @@ def run(proxy: Optional[str]) -> tuple:
             proxies=proxies
         )
         if signup_resp.status_code == 403:
-            print(f"[{ts()}] [WARNING] 注册请求触发 403 拦截，稍作等待后重试...")
+            print(f"[{ts()}] [WARNING] {email} 注册请求触发 403 拦截，稍作等待后重试...")
             return "retry_403", None
         elif signup_resp.status_code != 200:
             print(f"[{ts()}] [ERROR] 注册表单提交失败，中断当前流程: {signup_resp.text}")
@@ -1625,14 +1687,16 @@ def process_account_worker(i: int, total: int, item: dict, args: Any) -> bool:
 
 def handle_registration_result(result: Any, cpa_upload: bool = False) -> str:
     """统一处理注册返回结果，保存到本地并可选择上传CPA"""
-    if not result:
-        print(f"[{ts()}] [ERROR] 本次注册任务执行失败")
+    if not result or result[0] is None:
+        print(f"[{ts()}] [ERROR] 本次注册任务执行失败，不计入统计。")
         return "failed"
         
     token_json_str, password = result
-    if token_json_str == "retry_403":
-        print(f"[{ts()}] [WARNING] 检测到 403 频率限制，挂起重试...")
-        return "retry_403"
+    if not token_json_str or token_json_str == "retry_403":
+        if token_json_str == "retry_403":
+            print(f"[{ts()}] [WARNING] 检测到 403 频率限制，挂起重试...")
+            return "retry_403"
+        return "failed"
         
     if token_json_str:
         token_data = json.loads(token_json_str)
@@ -1648,7 +1712,7 @@ def handle_registration_result(result: Any, cpa_upload: bool = False) -> str:
             json_path = os.path.join(base_dir, json_file_name)
             with open(json_path, "w", encoding="utf-8") as f:
                 f.write(token_json_str)
-            print(f"[{ts()}] [SUCCESS] 本地 JSON 备份成功: {json_file_name}")
+            print(f"[{ts()}] [SUCCESS] 本地 JSON 备份成功: {mask_email(json_file_name)}")
 
             if account_email and password:
                 accounts_file = os.path.join(base_dir, "accounts.txt")
@@ -1668,7 +1732,7 @@ def handle_registration_result(result: Any, cpa_upload: bool = False) -> str:
 
 
 async def cpa_main_loop(args):
-    """CPA 智能仓管模式 (测活、清理、补货、上传一体化)"""
+    """CPA 智能仓管模式 (接入发牌器，防止撞车)"""
     print("=" * 60)
     print(f"   目标库存阈值: {MIN_ACCOUNTS_THRESHOLD} | 单次补发量: {BATCH_REG_COUNT}")
     print(f"   周限额剔除规则: 剩余低于 {MIN_REMAINING_WEEKLY_PERCENT}%" if MIN_REMAINING_WEEKLY_PERCENT > 0 else "   周限额剔除规则: 完全耗尽才剔除")
@@ -1687,6 +1751,7 @@ async def cpa_main_loop(args):
             all_files = res.json().get("files", [])
             codex_files = [f for f in all_files if "codex" in str(f.get("type","")).lower() or "codex" in str(f.get("provider","")).lower()]
             total_files = len(codex_files)
+            
             with ThreadPoolExecutor(max_workers=CPA_THREADS) as executor:
                 futures = []
                 for i, item in enumerate(codex_files, 1):
@@ -1694,37 +1759,67 @@ async def cpa_main_loop(args):
                         loop.run_in_executor(executor, process_account_worker, i, total_files, item, args)
                     )
                 results = await asyncio.gather(*futures)
+            
             valid_count = sum(1 for is_valid in results if is_valid)
             print(f"[{ts()}] [INFO] 巡检结束，当前仓库有效数: {valid_count}")
-
-            if valid_count < MIN_ACCOUNTS_THRESHOLD:
-                print(f"[{ts()}] [INFO] 侦测到库存不足 (当前 {valid_count} < 阈值 {MIN_ACCOUNTS_THRESHOLD})，启动注册补货...")
-                if not smart_switch_node():
-                    print(f"[{ts()}] [WARNING] 节点切换失败，将使用当前 IP 继续尝试...")
-                await asyncio.sleep(1)
                 
-                if ENABLE_MULTI_THREAD_REG:
-                    print(f"[{ts()}] [INFO] 启动多线程并发补货... (并发线程数: {REG_THREADS}, 目标数: {BATCH_REG_COUNT})")
-                    with ThreadPoolExecutor(max_workers=REG_THREADS) as executor:
-                        reg_futures = [
-                            loop.run_in_executor(executor, run, args.proxy)
-                            for _ in range(BATCH_REG_COUNT)
-                        ]
-                        reg_results = await asyncio.gather(*reg_futures)
-                        
-                    for result in reg_results:
-                        status = handle_registration_result(result, cpa_upload=True)
-                        if status == "retry_403":
+            if valid_count < MIN_ACCOUNTS_THRESHOLD:
+                need_to_reg = BATCH_REG_COUNT
+                success_in_this_cycle = 0
+                print(f"[{ts()}] [INFO] 侦测到库存不足 (当前 {valid_count} < {MIN_ACCOUNTS_THRESHOLD})，启动注册补货...")
+                await asyncio.sleep(1)
+                def cpa_safe_reg_worker():
+                    if _clash_enable and _clash_pool_mode:
+                        p = PROXY_QUEUE.get() 
+                        try:
+                            return run_and_refresh(p, args, cpa_upload=True, skip_switch=False) 
+                        finally:
+                            PROXY_QUEUE.put(p)
+                            PROXY_QUEUE.task_done()
+                    else:
+                        return run_and_refresh(args.proxy, args, cpa_upload=True, skip_switch=True)
+                while success_in_this_cycle < need_to_reg:
+                    remaining_gap = need_to_reg - success_in_this_cycle
+                    current_batch_size = min(REG_THREADS, remaining_gap)
+                    if _clash_enable and not _clash_pool_mode:
+                        print(f"[{ts()}] [INFO] [CPA补货] 触发单端口共享模式，正在为本批次并发切换全局节点...")
+                        if not smart_switch_node(args.proxy):
+                            print(f"[{ts()}] [WARNING] [CPA补货] 全局节点切换失败，将使用当前 IP 继续尝试...")
+
+                    if ENABLE_MULTI_THREAD_REG:
+                        print(f"[{ts()}] [INFO] 启动多线程并发补货: {success_in_this_cycle}/{need_to_reg} (启动 {current_batch_size} 线程)")
+                        with ThreadPoolExecutor(max_workers=current_batch_size) as executor:
+                            reg_futures = []
+                            for _ in range(current_batch_size):
+                                reg_futures.append(loop.run_in_executor(executor, cpa_safe_reg_worker))
+                                
+                            reg_results = await asyncio.gather(*reg_futures)
+                            
+                        for status in reg_results:
+                            if status == "success":
+                                success_in_this_cycle += 1
+                            elif status == "retry_403":
+                                print(f"[{ts()}] [WARNING] 遇到 403 频率限制，给服务器 15 秒冷却时间...")
+                                await asyncio.sleep(15)
+                    else:
+                        print(f"[{ts()}] [INFO] 启动单线程串行补货目标数: {success_in_this_cycle}/{need_to_reg}")
+                        if _clash_enable and _clash_pool_mode:
+                            p = PROXY_QUEUE.get()
+                            try:
+                                status = await loop.run_in_executor(None, run_and_refresh, p, args, True, False)
+                            finally:
+                                PROXY_QUEUE.put(p)
+                                PROXY_QUEUE.task_done()
+                        else:
+                            status = await loop.run_in_executor(None, run_and_refresh, args.proxy, args, True, True)
+                            
+                        if status == "success":
+                            success_in_this_cycle += 1
+                        elif status == "retry_403":
                             await asyncio.sleep(10)
-                else:
-                    print(f"[{ts()}] [INFO] 启动单线程串行补货... (目标数: {BATCH_REG_COUNT})")
-                    for _ in range(BATCH_REG_COUNT):
-                        result = await loop.run_in_executor(None, run, args.proxy)
-                        status = handle_registration_result(result, cpa_upload=True)
-                        if status == "retry_403":
-                            await asyncio.sleep(10)
-                            continue
+
                         await asyncio.sleep(5)
+                print(f"[{ts()}] [SUCCESS] 本轮补货任务圆满完成！累计入库: {success_in_this_cycle} 个。")
             else:
                 print(f"[{ts()}] [INFO] 仓库存量充足，无需补发。")
             
@@ -1734,6 +1829,15 @@ async def cpa_main_loop(args):
         except Exception as e:
             print(f"[{ts()}] [ERROR] 主循环异常: {e}")
             await asyncio.sleep(60)
+
+def run_and_refresh(proxy, args, cpa_upload=False, skip_switch=False):
+    """包装层：执行前先切节点 -> 注册 -> 处理结果"""
+    if not skip_switch:
+        if not smart_switch_node(proxy):
+            print(f"[{ts()}] [WARNING] {proxy} 节点切换失败，将使用当前 IP 继续尝试...")
+    result = run(proxy)
+    status = handle_registration_result(result, cpa_upload=cpa_upload)
+    return status
 
 def normal_main_loop(args):
     """常规模式 (纯量产注册，存本地)"""
@@ -1757,37 +1861,51 @@ def normal_main_loop(args):
 
         total_attempts += 1
         print(f"\n[{ts()}] --- 开始发起第 {total_attempts} 次注册请求 (当前已成功: {success_count}) ---")
-        
-        if not smart_switch_node():
-            print(f"[{ts()}] [WARNING] 节点切换失败，将使用当前 IP 继续尝试...")
         time.sleep(1)
 
         try:
+            if _clash_enable and not _clash_pool_mode:
+                print(f"[{ts()}] [INFO] 触发单端口共享模式，正在进行全局节点切换...")
+                if not smart_switch_node(args.proxy):
+                    print(f"[{ts()}] [WARNING] 全局节点切换失败，将使用当前 IP 继续尝试...")
+
             if ENABLE_MULTI_THREAD_REG:
-                current_batch_size = REG_THREADS
-                if target_count > 0:
-                    current_batch_size = min(REG_THREADS, target_count - success_count)
+                current_batch_size = min(REG_THREADS, target_count - success_count) if target_count > 0 else REG_THREADS
+                print(f"[{ts()}] [INFO] 启用 多线程并发... (分配 {current_batch_size} 条独立通道)")
 
-                print(f"[{ts()}] [INFO] 启用多线程并发... (并发分配: {current_batch_size})")
+                def thread_worker_wrapper():
+                    if _clash_enable and _clash_pool_mode:
+                        selected_proxy = PROXY_QUEUE.get()
+                        try:
+                            return run_and_refresh(selected_proxy, args, False, skip_switch=False)
+                        finally:
+                            PROXY_QUEUE.put(selected_proxy)
+                            PROXY_QUEUE.task_done()
+                    else:
+                        return run_and_refresh(args.proxy, args, False, skip_switch=True)
+
                 with ThreadPoolExecutor(max_workers=current_batch_size) as executor:
-                    futures = [executor.submit(run, args.proxy) for _ in range(current_batch_size)]
+                    futures = []
+                    for _ in range(current_batch_size):
+                        futures.append(executor.submit(thread_worker_wrapper))
+                    
                     for future in futures:
-                        result = future.result()
-                        status = handle_registration_result(result, cpa_upload=False)
-                        if status == "success":
+                        if future.result() == "success":
                             success_count += 1
-                        elif status == "retry_403":
-                            time.sleep(10)
-
             else:
-                print(f"[{ts()}] [INFO] 启用单线程注册...")
-                result = run(args.proxy)
-                status = handle_registration_result(result, cpa_upload=False)
+                if _clash_enable and _clash_pool_mode:
+                    selected_proxy = PROXY_QUEUE.get()
+                    try:
+                        status = run_and_refresh(selected_proxy, args, False, skip_switch=False)
+                    finally:
+                        PROXY_QUEUE.put(selected_proxy)
+                        PROXY_QUEUE.task_done()
+                else:
+
+                    status = run_and_refresh(args.proxy, args, False, skip_switch=True)
+
                 if status == "success":
                     success_count += 1
-                elif status == "retry_403":
-                    time.sleep(10)
-                    continue
 
         except Exception as e:
             print(f"[{ts()}] [ERROR] 发生未捕获全局异常: {e}")

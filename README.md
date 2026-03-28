@@ -51,7 +51,30 @@ A Python utility for mailbox integration, one-time passcode (OTP) retrieval, mes
   - [13. `cpa_mode`](#13-cpa_mode)
   - [14. `normal_mode`](#14-normal_mode)
   - [15. Configuration suggestions](#15-configuration-suggestions)
+- [16. `cloudmail`](#16-cloudmail)
+- [17. `mail_curl`](#17-mail_curl)
+- [18. `enable_multi_thread_reg`](#18-enable_multi_thread_reg)
+- [19. `reg_threads`](#19-reg_threads)
+- [20. `warp_proxy_list`](#20-warp_proxy_list)
+- [21. `cpa_mode.remove_on_limit_reached`](#21-cpa_moderemove_on_limit_reached)
+- [22. `cpa_mode.remove_dead_accounts`](#22-cpa_moderemove_dead_accounts)
+- [23. `cpa_mode.threads`](#23-cpa_modethreads)
+- [24. `normal_mode.target_count`](#24-normal_modetarget_count)
+- [25. Environment variables](#25-environment-variables)
+- [26. Config file name note](#26-config-file-name-note)
 - [Usage](#usage)
+- [Additional configuration fields actually used by the code](#additional-configuration-fields-actually-used-by-the-code)
+  - [16. `cloudmail`](#16-cloudmail)
+  - [17. `mail_curl`](#17-mail_curl)
+  - [18. `enable_multi_thread_reg`](#18-enable_multi_thread_reg)
+  - [19. `reg_threads`](#19-reg_threads)
+  - [20. `warp_proxy_list`](#20-warp_proxy_list)
+  - [21. `cpa_mode.remove_on_limit_reached`](#21-cpa_moderemove_on_limit_reached)
+  - [22. `cpa_mode.remove_dead_accounts`](#22-cpa_moderemove_dead_accounts)
+  - [23. `cpa_mode.threads`](#23-cpa_modethreads)
+  - [24. `normal_mode.target_count`](#24-normal_modetarget_count)
+  - [25. Environment variables](#25-environment-variables)
+  - [26. Config file name note](#26-config-file-name-note)
 - [Output Files](#output-files)
 - [Troubleshooting](#troubleshooting)
 - [Security Notes](#security-notes)
@@ -504,6 +527,222 @@ Run once:
 ```bash
 python wfxl_openai_regst.py --once
 ```
+
+## Additional configuration fields actually used by the code
+
+The current codebase reads and uses several configuration fields that were present in `configwfxl.yaml` but not fully documented earlier in this README.
+
+### 16. `cloudmail`
+
+The code supports a `cloudmail` backend in addition to `imap`, `freemail`, and `cloudflare_temp_email`.
+
+```yaml
+cloudmail:
+  api_url: "https://your-domain.com"
+  admin_email: "admin@your-domain.com"
+  admin_password: "your-admin-password"
+```
+
+Field notes:
+
+- `api_url`: CloudMail service base URL
+- `admin_email`: administrator email used to request an access token
+- `admin_password`: administrator password used to request an access token
+
+Behavior summary:
+
+- The script first requests a CloudMail token from `/api/public/genToken`
+- It then creates mailbox users through `/api/public/addUser`
+- It later checks incoming messages through `/api/public/emailList`
+
+Use this mode with:
+
+```yaml
+email_api_mode: "cloudmail"
+```
+
+### 17. `mail_curl`
+
+The code also supports a `mail_curl` mailbox backend.
+
+```yaml
+mail_curl:
+  api_base: "https://your-domain.com"
+  key: "your-api-key"
+```
+
+Field notes:
+
+- `api_base`: Mail Curl service base URL
+- `key`: service key used for mailbox creation and message retrieval
+
+Behavior summary:
+
+- Mailboxes are requested through `/api/remail`
+- Inbox listing is queried through `/api/inbox`
+- Individual email content is fetched through `/api/mail`
+
+Use this mode with:
+
+```yaml
+email_api_mode: "mail_curl"
+```
+
+### 18. `enable_multi_thread_reg`
+
+Controls whether registration runs in concurrent worker mode.
+
+```yaml
+enable_multi_thread_reg: false
+```
+
+- `false`: single-threaded registration
+- `true`: concurrent registration using a thread pool
+
+This affects both normal registration mode and CPA replenishment mode.
+
+### 19. `reg_threads`
+
+Controls the maximum number of concurrent registration threads when multi-threading is enabled.
+
+```yaml
+reg_threads: 10
+```
+
+Recommendations:
+
+- Start low and increase gradually
+- Keep the value aligned with your proxy quality and mailbox throughput
+- Avoid setting it too high when using a single shared outbound proxy
+
+### 20. `warp_proxy_list`
+
+A list of local proxy endpoints used in Clash pool mode.
+
+```yaml
+warp_proxy_list:
+  - "http://127.0.0.1:41001"
+  - "http://127.0.0.1:41002"
+  - "http://127.0.0.1:41003"
+```
+
+Behavior summary:
+
+- This list is only used when both `clash_proxy_pool.enable: true` and `clash_proxy_pool.pool_mode: true`
+- Each proxy is treated as an independent outbound channel / container
+- The code maps proxy ports such as `41001` to controller ports such as `42001`
+
+Typical usage:
+
+- **Single local Clash instance**: leave `pool_mode: false` and `warp_proxy_list` can remain empty
+- **Multi-container server setup**: set `pool_mode: true` and provide one proxy endpoint per container
+
+### 21. `cpa_mode.remove_on_limit_reached`
+
+Controls what happens when an account reaches the weekly limit or falls below the configured remaining-quota threshold.
+
+```yaml
+cpa_mode:
+  remove_on_limit_reached: false
+```
+
+- `false`: disable the credential in CPA and keep it for possible future recovery
+- `true`: physically delete the credential from CPA storage
+
+### 22. `cpa_mode.remove_dead_accounts`
+
+Controls what happens when a credential is determined to be permanently invalid and token refresh rescue fails.
+
+```yaml
+cpa_mode:
+  remove_dead_accounts: false
+```
+
+- `false`: keep the credential but disable it
+- `true`: physically delete the credential from CPA storage
+
+### 23. `cpa_mode.threads`
+
+Controls the worker count used during CPA inventory inspection and account health checks.
+
+```yaml
+cpa_mode:
+  threads: 10
+```
+
+This is separate from `reg_threads`:
+
+- `reg_threads`: registration concurrency
+- `cpa_mode.threads`: CPA inventory inspection / rescue concurrency
+
+### 24. `normal_mode.target_count`
+
+Controls how many successful registrations to complete before the script stops automatically in normal mode.
+
+```yaml
+normal_mode:
+  target_count: 2
+```
+
+- `0`: run continuously until interrupted
+- `> 0`: stop automatically after reaching the target number of successful registrations
+
+This value is ignored by CPA maintenance mode.
+
+### 25. Environment variables
+
+In addition to YAML configuration, the code also reads several environment variables:
+
+#### `OPENAI_SSL_VERIFY`
+
+Controls HTTPS certificate verification.
+
+- default: enabled
+- set to `0`, `false`, `no`, or `off` to disable verification
+
+Example:
+
+```bash
+OPENAI_SSL_VERIFY=0
+```
+
+#### `SKIP_NET_CHECK`
+
+Skips the outbound network / region validation check before starting registration.
+
+- default: disabled
+- set to `1`, `true`, `yes`, or `on` to skip the check
+
+Example:
+
+```bash
+SKIP_NET_CHECK=1
+```
+
+#### `.env` support
+
+The script also loads a local `.env` file automatically if present in the working directory.
+
+Example:
+
+```env
+OPENAI_SSL_VERIFY=1
+SKIP_NET_CHECK=0
+```
+
+### 26. Config file name note
+
+There is an important implementation detail in the current code:
+
+- `README.md` previously described the main config file as `config.yaml`
+- the current Python code actually reads **`configwfxl.yaml`** in both `wfxl_openai_regst.py` and `proxy_manager.py`
+
+If you keep your config file named `config.yaml`, the current code will not read it unless you rename it or modify the code.
+
+If you want the documentation and code to match, choose one of these approaches:
+
+1. Rename your runtime config file from `config.yaml` to `configwfxl.yaml`
+2. Or modify the code so both files read `config.yaml`
 
 ## Output Files
 

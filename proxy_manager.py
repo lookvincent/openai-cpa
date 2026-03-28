@@ -1,4 +1,3 @@
-# proxy_manager.py
 import urllib.parse
 import random
 import time
@@ -7,16 +6,27 @@ from datetime import datetime
 import yaml
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
-with open("config.yaml", "r", encoding="utf-8") as f:
-    config = yaml.safe_load(f)
+config_path = "config.yaml"
+if not os.path.exists(config_path):
+    print(f"[ERROR] 配置文件 {config_path} 不存在，使用默认配置。")
+    config = {}
+else:
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
 
 clash_conf = config.get("clash_proxy_pool", {})
 ENABLE_NODE_SWITCH = clash_conf.get("enable", False)
-CLASH_API_URL = clash_conf.get("api_url", "http://127.0.0.1:9097")
+
+POOL_MODE = clash_conf.get("pool_mode", False)
+FASTEST_MODE = clash_conf.get("fastest_mode", False)
+
+CLASH_API_URL = clash_conf.get("api_url", "http://127.0.0.1:9090")
+LOCAL_PROXY_URL = clash_conf.get("test_proxy_url", "http://127.0.0.1:7890")
+
 PROXY_GROUP_NAME = clash_conf.get("group_name", "节点选择")
 CLASH_SECRET = clash_conf.get("secret", "")
-LOCAL_PROXY_URL = clash_conf.get("test_proxy_url", "")
 DEFAULT_BLACKLIST = ["港", "HK", "台", "TW", "中", "CN"]
 NODE_BLACKLIST = clash_conf.get("blacklist", DEFAULT_BLACKLIST)
 
@@ -24,93 +34,6 @@ def ts() -> str:
     """获取当前时间戳字符串，用于日志"""
     return datetime.now().strftime("%H:%M:%S")
 
-def test_proxy_liveness():
-    """测试当前代理是否可用，并检查国家/地区归属"""
-    proxies = {"http": LOCAL_PROXY_URL, "https": LOCAL_PROXY_URL}
-    try:
-        res = std_requests.get("https://cloudflare.com/cdn-cgi/trace", proxies=proxies, timeout=5)
-        if res.status_code == 200:
-            loc = "UNKNOWN"
-            for line in res.text.split('\n'):
-                if line.startswith("loc="):
-                    loc = line.split("=")[1].strip()
-
-            blocked_regions = ["CN", "HK"]
-            if loc in blocked_regions:
-                print(f"   节点能通，但 IP 归属地为受限区 ({loc})，弃用！")
-                return False
-                
-            print(f"   节点测活成功！地区合规 ({loc})，响应延迟: {res.elapsed.total_seconds():.2f}s")
-            return True
-        return False
-    except Exception:
-        print(f"   节点无法连通外网或超时丢包。")
-        return False
-
-def smart_switch_node():
-    """智能切换节点并测活的核心逻辑，支持策略组名称模糊匹配"""
-    if not ENABLE_NODE_SWITCH:
-        return True
-        
-    headers = {"Authorization": f"Bearer {CLASH_SECRET}"} if CLASH_SECRET else {}
-    
-    try:
-        resp = std_requests.get(f"{CLASH_API_URL}/proxies", headers=headers, timeout=5)
-        if resp.status_code != 200:
-            print(f"[{ts()}] [ERROR] 无法连接 Clash API，请检查配置。")
-            return False
-            
-        proxies_data = resp.json()['proxies']
-
-        actual_group_name = None
-        for key in proxies_data.keys():
-            if PROXY_GROUP_NAME in key and isinstance(proxies_data[key], dict) and 'all' in proxies_data[key]:
-                actual_group_name = key
-                break
-                
-        if not actual_group_name:
-            available_groups = [k for k in proxies_data.keys() if isinstance(proxies_data[k], dict) and 'all' in proxies_data[k]]
-            print(f"[{ts()}] [ERROR] 找不到包含关键词 '{PROXY_GROUP_NAME}' 的策略组！")
-            print(f"[{ts()}] [INFO] 当前可用的策略组有: {available_groups}")
-            return False
-            
-        print(f"[{ts()}] [INFO] 自动匹配到真实策略组: [{clean_for_log(actual_group_name)}]")
-        
-        safe_group_name = urllib.parse.quote(actual_group_name)
-        all_nodes = proxies_data[actual_group_name]['all']
-        
-        valid_nodes = [
-            n for n in all_nodes 
-            if not any(kw.upper() in n.upper() for kw in NODE_BLACKLIST)
-        ]
-        
-        if not valid_nodes:
-            print(f"[{ts()}] [ERROR] 过滤后没有可用安全节点！请检查 config.yaml 里的 blacklist 是否过于严格。")
-            return False
-
-        max_retries = 10
-        for i in range(1, max_retries + 1):
-            selected_node = random.choice(valid_nodes)
-            print(f"\n[{ts()}] [INFO] [代理池] 尝试切换节点: [{clean_for_log(selected_node)}] ({i}/{max_retries})")
-            switch_resp = std_requests.put(
-                f"{CLASH_API_URL}/proxies/{safe_group_name}", 
-                headers=headers, json={"name": selected_node}, timeout=5
-            )
-            
-            if switch_resp.status_code == 204:
-                time.sleep(1.5)
-                if test_proxy_liveness():
-                    return True
-                # else:
-                    print(f"[{ts()}] [代理池] 重新抽卡...")
-            else:
-                print(f"[{ts()}] [代理池] 切换指令下发失败。")
-                
-        print(f"\n[{ts()}] [代理池] 抽卡 10 次全败，请检查节点状态！")
-        return False
-    except Exception as e:
-        print(f"[{ts()}] [ERROR] 节点切换异常: {e}")
-        return False
 def clean_for_log(text: str) -> str:
     """用于日志输出：过滤掉字符串中的国旗、飞机、火箭等 Emoji 符号"""
     emoji_pattern = re.compile(
@@ -121,3 +44,171 @@ def clean_for_log(text: str) -> str:
         r'|[\uFE0F]'
     )
     return emoji_pattern.sub('', text).strip()
+
+def get_display_name(proxy_url: str) -> str:
+    """统一日志脱敏：将 URL 转换为 [X号机] 或隐藏域名"""
+    if not proxy_url:
+        return "全局单机"
+    try:
+        parsed = urllib.parse.urlparse(proxy_url)
+        if parsed.port and 41000 < parsed.port <= 41050:
+            return f"{parsed.port - 41000}号机"
+        return f"端口:{parsed.port}"
+    except:
+        return "未知通道"
+
+def get_api_url_for_proxy(proxy_url: str) -> str:
+    """根据开关决定是独立容器 API，还是使用固定 API"""
+    if not POOL_MODE or not proxy_url:
+        return CLASH_API_URL
+    try:
+        parsed = urllib.parse.urlparse(proxy_url)
+        port = parsed.port
+        if port and 41000 < port <= 41050:
+            api_port = port + 1000
+            return f"http://{parsed.hostname}:{api_port}"
+    except Exception:
+        pass
+    return CLASH_API_URL
+
+def test_proxy_liveness(proxy_url=None):
+    """测试当前代理是否可用 (脱敏)"""
+    target_proxy = proxy_url if proxy_url else LOCAL_PROXY_URL
+    proxies = {"http": target_proxy, "https": target_proxy}
+    display_name = get_display_name(proxy_url if proxy_url else LOCAL_PROXY_URL)
+    
+    try:
+        res = std_requests.get("https://cloudflare.com/cdn-cgi/trace", proxies=proxies, timeout=5)
+        if res.status_code == 200:
+            loc = "UNKNOWN"
+            for line in res.text.split('\n'):
+                if line.startswith("loc="):
+                    loc = line.split("=")[1].strip()
+
+            blocked_regions = ["CN", "HK"]
+            if loc in blocked_regions:
+                print(f"[{ts()}] [代理测活] {display_name} 地区受限 ({loc})，弃用！")
+                return False
+                
+            print(f"[{ts()}] [代理测活] {display_name} 成功！地区 ({loc})，延迟: {res.elapsed.total_seconds():.2f}s")
+            return True
+        return False
+    except Exception:
+        print(f"[{ts()}] [代理测活] {display_name} 链路中断或超时。")
+        return False
+
+def smart_switch_node(proxy_url=None):
+    """智能切换节点并测活的核心逻辑 (脱敏)"""
+    if not ENABLE_NODE_SWITCH:
+        return True
+        
+    current_api_url = get_api_url_for_proxy(proxy_url)
+    headers = {"Authorization": f"Bearer {CLASH_SECRET}"} if CLASH_SECRET else {}
+    
+    display_name = get_display_name(proxy_url)
+
+    api_display = get_display_name(current_api_url).replace("号机", "号API")
+    
+    try:
+        resp = std_requests.get(f"{current_api_url}/proxies", headers=headers, timeout=5)
+        if resp.status_code != 200:
+            print(f"[{ts()}] [ERROR] 无法连接 Clash API ({api_display})，请检查容器状态。")
+            return False
+            
+        proxies_data = resp.json().get('proxies', {})
+
+        actual_group_name = None
+        for key in proxies_data.keys():
+            if PROXY_GROUP_NAME in key and isinstance(proxies_data[key], dict) and 'all' in proxies_data[key]:
+                actual_group_name = key
+                break
+                
+        if not actual_group_name:
+            print(f"[{ts()}] [ERROR] {display_name} 找不到策略组关键词 '{PROXY_GROUP_NAME}'")
+            return False
+            
+        safe_group_name = urllib.parse.quote(actual_group_name)
+        all_nodes = proxies_data[actual_group_name].get('all', [])
+        
+        valid_nodes = [
+            n for n in all_nodes 
+            if not any(kw.upper() in n.upper() for kw in NODE_BLACKLIST)
+        ]
+        
+        if not valid_nodes:
+            print(f"[{ts()}] [ERROR] {display_name} 过滤后无可用节点，请检查黑名单。")
+            return False
+
+        if FASTEST_MODE:
+            print(f"\n[{ts()}] [代理池] {display_name} 开启优选模式，并发测速 {len(valid_nodes)} 个节点...")
+            def trigger_delay(n):
+                enc_n = urllib.parse.quote(n)
+                try:
+                    std_requests.get(
+                        f"{current_api_url}/proxies/{enc_n}/delay?timeout=3000&url=http://www.gstatic.com/generate_204", 
+                        headers=headers, timeout=4
+                    )
+                except:
+                    pass
+                    
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                executor.map(trigger_delay, valid_nodes)
+                
+            time.sleep(1.5)
+            
+            try:
+                resp2 = std_requests.get(f"{current_api_url}/proxies", headers=headers, timeout=5)
+                if resp2.status_code == 200:
+                    p_data = resp2.json().get('proxies', {})
+                    best_node = None
+                    min_delay = float('inf')
+                    
+                    for n in valid_nodes:
+                        history = p_data.get(n, {}).get("history", [])
+                        if history:
+                            delay = history[-1].get("delay", 0)
+                            if 0 < delay < min_delay:
+                                min_delay = delay
+                                best_node = n
+                    
+                    if best_node:
+                        print(f"[{ts()}] [代理池] {display_name} 测速完成，最快节点: [{clean_for_log(best_node)}] ({min_delay}ms)")
+                        switch_resp = std_requests.put(
+                            f"{current_api_url}/proxies/{safe_group_name}", 
+                            headers=headers, json={"name": best_node}, timeout=5
+                        )
+                        if switch_resp.status_code == 204:
+                            time.sleep(1)
+                            if test_proxy_liveness(proxy_url):
+                                return True
+                            print(f"[{ts()}] [代理池] {display_name} 最快节点测活失败，回退到随机抽卡模式...")
+                    else:
+                        print(f"[{ts()}] [代理池] {display_name} 所有节点均超时，回退到随机抽卡模式...")
+            except Exception as e:
+                print(f"[{ts()}] [代理池] {display_name} 优选模式异常: {e}，回退到随机抽卡模式...")
+
+        max_retries = 10
+        for i in range(1, max_retries + 1):
+            selected_node = random.choice(valid_nodes)
+            
+            print(f"\n[{ts()}] [代理池] {display_name} 尝试切换节点: [{clean_for_log(selected_node)}] ({i}/{max_retries})")
+            
+            switch_resp = std_requests.put(
+                f"{current_api_url}/proxies/{safe_group_name}", 
+                headers=headers, json={"name": selected_node}, timeout=5
+            )
+            
+            if switch_resp.status_code == 204:
+                time.sleep(1.5)
+                if test_proxy_liveness(proxy_url):
+                    return True
+                print(f"[{ts()}] [代理池] {display_name} 测活失败，重新抽卡...")
+            else:
+                print(f"[{ts()}] [代理池] {display_name} 指令下发失败 (HTTP {switch_resp.status_code})。")
+                
+        print(f"\n[{ts()}] [代理池] {display_name} 连续 10 次抽卡均不可用！")
+        return False
+        
+    except Exception as e:
+        print(f"[{ts()}] [ERROR] {display_name} 切换节点异常: {e}")
+        return False
