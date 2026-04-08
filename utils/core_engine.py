@@ -530,14 +530,19 @@ def handle_registration_result(result: Any, cpa_upload: bool = False, run_ctx: d
 
         masked_email = mask_email(account_email)
         safe_pwd = str(password) if password else ""
-        masked_password = f"{safe_pwd[:2]}****{safe_pwd[-2:]}" if len(safe_pwd) > 4 else "****"
+        orig_masked_email = mask_email(account_email)
+        orig_masked_password = f"{safe_pwd[:2]}****{safe_pwd[-2:]}" if len(safe_pwd) > 4 else "****"
+
+        final_email = orig_masked_email if getattr(cfg, 'TG_BOT', {}).get("mask_email", False) else account_email
+        final_password = orig_masked_password if getattr(cfg, 'TG_BOT', {}).get("mask_password", False) else safe_pwd
+
         template_str = getattr(cfg, 'TG_BOT', {}).get("template_success", "成功: {email} / {password} 时间: {time}")
         beijing_tz = timezone(timedelta(hours=8))
         current_time = datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
         try:
-            success_text = template_str.format(email=account_email, password=safe_pwd, masked_email=masked_email, masked_password=masked_password, time=current_time)
+            success_text = template_str.format(email=account_email, password=safe_pwd, time=current_time)
         except Exception:
-            success_text = f"🎉 注册成功\n账号: {account_email}\n密码: {safe_pwd}\n时间: {current_time}\n(温馨提示: 您的TG单号自定义模板配置有误)"
+            success_text = f"🎉 注册成功\n账号: {final_email}\n密码: {final_password}\n时间: {current_time}\n(温馨提示: 您的TG单号自定义模板配置有误)"
 
         send_tg_msg_sync(success_text)
     return ret_status

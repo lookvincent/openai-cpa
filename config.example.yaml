@@ -237,6 +237,8 @@ tg_bot:
   enable: false
   token: ''
   chat_id: ''
+  mask_email: false
+  mask_password: false
 
 # WEB端密码
 web_password: admin

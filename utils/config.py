@@ -457,6 +457,8 @@ def reload_all_configs():
         "enable": _tg.get("enable", False),
         "token": str(_tg.get("token", "")),
         "chat_id": str(_tg.get("chat_id", "")),
+        "mask_email": _tg.get("mask_email", False),
+        "mask_password": _tg.get("mask_password", False),
         "template_success": _tg.get("template_success",
                                     "🎉 <b>注册成功</b>\n⏰ 时间: <code>{time}</code>\n📧 账号: <code>{email}</code>\n🔑 密码: <code>{password}</code>"),
         "template_stop": _tg.get("template_stop",
