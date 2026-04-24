@@ -25,4 +25,4 @@ utils/auth_core/
 !utils/auth_core.pyd
 test.py
 aitest.py
-register.py
+register.py.bak
